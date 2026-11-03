@@ -4,6 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import logger from '../logger.js';
 import actualToolsManager from '../actualToolsManager.js';
+import { closeApiSession } from '../lib/actual-adapter.js';
 import type { ActualMCPConnection } from '../lib/ActualMCPConnection.js';
 
 export async function startStdioServer(
@@ -65,6 +66,12 @@ export async function startStdioServer(
   process.stdin.on('end', async () => {
     logger.debug('[STDIO] stdin closed — shutting down');
     await transport.close();
+    // Close a kept-alive Actual session (sync + close budget) before exiting.
+    try {
+      await closeApiSession();
+    } catch (err) {
+      logger.warn('[STDIO] Error closing Actual session:', err);
+    }
     process.exit(0);
   });
 

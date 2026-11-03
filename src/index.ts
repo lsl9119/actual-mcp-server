@@ -17,6 +17,19 @@ process.on('unhandledRejection', (reason, promise) => {
   // we should log but NOT crash the server.
   const reasonStr = String(reason);
   const reasonObj = reason as any;
+
+  // @actual-app/api's runHandler() does `promise.then(() => runningMethods.delete(promise))`
+  // without a rejection handler, so EVERY failed SDK handler call (download-budget
+  // "unauthorized", "No budget file is open", sync failures, invalid queries…)
+  // also rejects a phantom derived promise nobody can observe — even though the
+  // original promise was returned to, and handled by, our adapter. Those are not
+  // real unhandled errors; exiting on them used to crash the server under load.
+  const stack = typeof reasonObj?.stack === 'string' ? reasonObj.stack : '';
+  if (stack.includes('@actual-app/api') || stack.includes('@actual-app\\api')) {
+    console.error('⚠️  @actual-app/api internal rejection (already returned to the caller) — server continues.');
+    return;
+  }
+
   if (
     reasonStr.includes('does not exist in table') ||
     (reasonStr.includes('Field') && reasonStr.includes('does not exist')) ||

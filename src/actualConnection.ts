@@ -1,11 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import api from '@actual-app/api';
 import logger from './logger.js';
 import config from './config.js';
 import { connectionPool } from './lib/ActualConnectionPool.js';
-import { withActualApi, runExclusiveApi } from './lib/actual-adapter.js';
+import { withActualApi, closeApiSession } from './lib/actual-adapter.js';
 import { createModuleLogger } from './lib/loggerFactory.js';
 
 const log = createModuleLogger('CONNECTION');
@@ -71,11 +70,8 @@ export async function shutdownActual() {
   }
   
   try {
-    const maybeApi = api as unknown as { shutdown?: () => Promise<unknown> };
-    if (typeof maybeApi.shutdown === 'function') {
-      // Under the session lock so an in-flight tool call can finish first.
-      await runExclusiveApi(async () => { await maybeApi.shutdown!(); });
-    }
+    // Under the session lock so an in-flight tool call can finish first.
+    await closeApiSession();
     initialized = false;
     logger.info('Actual API shutdown complete.');
   } catch (err) {

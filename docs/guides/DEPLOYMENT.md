@@ -189,6 +189,15 @@ All other variables are optional — see [Configuration Reference](../../README.
 
 ---
 
+## Concurrency & Rate Limits
+
+- All tool calls share **one** Actual budget session and run one at a time (writes arriving together are batched). `MAX_CONCURRENT_SESSIONS` only caps how many MCP client sessions may be connected; it does not make Actual operations run in parallel.
+- The Actual Budget server (v26.x) applies a global limit of about 500 requests per minute per client IP. In the default mode every tool call logs in and syncs (~3 requests per call), so heavy concurrent use can trigger "Too many requests" / HTTP 429 errors from Actual.
+- **Recommendation:** try `ACTUAL_SESSION_KEEPALIVE_MS=60000`. The budget then stays open between calls, per-call latency drops to sub-second, and logins are far fewer. It is opt-in while it is validated in real deployments (default `0` = off).
+- Clients should treat JSON-RPC error `-32001` ("server busy") as retryable and wait `error.data.retryAfterMs` before retrying. Error `-32002` carries `error.data.phase`; only `init` is safe to retry automatically, since a timed-out `operation` write may already have been applied, so verify before retrying.
+
+---
+
 ## Why the `/data` volume is required
 
 Actual Budget does not expose a REST API. The `@actual-app/api` library (used internally) works by:

@@ -11,10 +11,9 @@
  * need to support multiple instances or we'd need request queuing.
  */
 
-import api from '@actual-app/api';
 import logger from '../logger.js';
 import config from '../config.js';
-import { withActualApi, runExclusiveApi } from './actual-adapter.js';
+import { withActualApi, closeApiSession } from './actual-adapter.js';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
@@ -23,9 +22,7 @@ const DEFAULT_DATA_DIR = path.resolve(os.homedir() || '.', '.actual');
 
 /** api.shutdown() under the shared API session lock (never mid-operation). */
 async function shutdownApiExclusive(): Promise<void> {
-  const maybeApi = api as unknown as { shutdown?: () => Promise<unknown> };
-  if (typeof maybeApi.shutdown !== 'function') return;
-  await runExclusiveApi(async () => { await maybeApi.shutdown!(); });
+  await closeApiSession();
 }
 
 interface ActualConnection {

@@ -422,11 +422,12 @@ All configuration is via environment variables. Copy `.env.example` to `.env` to
 | `USE_CONNECTION_POOL` | `true` | No | Enable session-based connection pooling |
 | `MAX_CONCURRENT_SESSIONS` | `15` | No | Maximum concurrent MCP sessions allowed |
 | `SESSION_IDLE_TIMEOUT_MINUTES` | `5` (pool) / `2` (HTTP) | No | Minutes before idle session cleanup |
-| `ACTUAL_LOCK_WAIT_TIMEOUT_MS` | `120000` | No | Max ms a request waits for the shared Actual API session before failing with a "server busy" error (`0` disables) |
+| `ACTUAL_LOCK_WAIT_TIMEOUT_MS` | `30000` | No | Max ms a request waits for the shared Actual API session before failing with a "server busy" error, JSON-RPC `-32001` (`0` disables) |
 | `ACTUAL_INIT_TIMEOUT_MS` | `60000` | No | Max ms for `api.init()` + `downloadBudget()` (`0` disables) |
 | `ACTUAL_OPERATION_TIMEOUT_MS` | `120000` | No | Max ms for one operation (a read, or one write in a batch). Must exceed the 30s bank-sync settle window (`0` disables) |
 | `ACTUAL_SYNC_TIMEOUT_MS` | `60000` | No | Max ms for `api.sync()` after a write batch (`0` disables) |
 | `ACTUAL_SHUTDOWN_TIMEOUT_MS` | `30000` | No | Max ms for `api.shutdown()`; the lock is released even if shutdown hangs (`0` disables) |
+| `ACTUAL_SESSION_KEEPALIVE_MS` | `0` | No | Keep the Actual budget open between tool calls for this many ms of inactivity (`0` = off, open/close per call). When enabled, suggested value `60000`. Opt-in while validated in real deployments |
 | **Security & Authentication** ||||
 | `AUTH_PROVIDER` | `none` | No | Auth mode: `none` (static Bearer) or `oidc` (JWKS-validated JWT) |
 | `MCP_SSE_AUTHORIZATION` | — | No | Static Bearer token (`AUTH_PROVIDER=none`; highly recommended in production) |
@@ -454,6 +455,12 @@ All configuration is via environment variables. Copy `.env.example` to `.env` to
 | `NODE_ENV` | `production` | No | Node environment; `production` hides stack traces in error responses |
 | `VERSION` | auto-detected | No | Server version (auto-set by build/Docker) |
 | `TZ` | `UTC` | No | Timezone for timestamps (e.g., `America/New_York`) |
+
+### Concurrency & Rate Limits
+
+- All tool calls share **one** Actual budget session and run one at a time (writes arriving together are batched). `MAX_CONCURRENT_SESSIONS` only caps how many MCP client sessions may be connected; it does not make Actual operations run in parallel.
+- The Actual Budget server (v26.x) applies a global limit of about 500 requests per minute per client IP. In the default mode every tool call logs in and syncs (~3 requests per call), so heavy concurrent use can trigger "Too many requests" / HTTP 429 errors from Actual. Enabling `ACTUAL_SESSION_KEEPALIVE_MS` (e.g. `60000`) greatly reduces this.
+- Clients should treat JSON-RPC error `-32001` ("server busy") as retryable and wait `error.data.retryAfterMs` (5000 ms) before retrying. Error `-32002` ("upstream timeout") reports `error.data.phase` (`init`, `operation`, `sync` or `shutdown`); only `init` is safe to retry automatically, because a timed-out `operation` write may already have been applied.
 
 ---
 

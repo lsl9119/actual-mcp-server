@@ -23,7 +23,7 @@
  *   MCP_AUTH_TOKEN        Bearer token override
  *   MCP_TEST_LEVEL        Test level override
  *   ACTUAL_SERVER_URL     Actual Budget server URL (shown in cleanup prompt)
- *   EXPECTED_TOOL_COUNT   Expected number of MCP tools (default: 62)
+ *   EXPECTED_TOOL_COUNT   Expected number of MCP tools (default: counted from src/actualToolsManager.ts)
  */
 
 import readline from 'node:readline/promises';
@@ -147,6 +147,9 @@ export async function run() {
         console.log("\n✓ Test data preserved (cleanup=no)");
       } else if (cleanup === 'yes' || cleanup === 'y') {
         console.log("\n✓ Deleting test data (cleanup=yes)");
+      } else if (!process.stdin.isTTY) {
+        // Non-interactive (CI, piped, agent-driven): readline would throw.
+        console.log("\n✓ Non-interactive session — deleting test data (default; pass 'no' to keep it)");
       } else {
         const answer = await Promise.race([
           rl.question("\nDelete all test data? (yes/no) [default: yes in 10s]: "),

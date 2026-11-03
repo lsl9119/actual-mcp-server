@@ -40,7 +40,7 @@ async function settleWithin(p, ms) {
 }
 
 (async () => {
-  const { createApiSessionManager, ApiTimeoutError, withTimeout } = await import('../../dist/src/lib/api-session.js');
+  const { createApiSessionManager, ApiTimeoutError, withTimeout, API_ERROR_CODES } = await import('../../dist/src/lib/api-session.js');
 
   /** Manager with counting fake hooks; `overrides` replaces individual hooks/options. */
   function makeManager(overrides = {}) {
@@ -125,6 +125,8 @@ async function settleWithin(p, ms) {
     check(stats.shutdown === 2, 'shutdown ran for both sessions', JSON.stringify(stats));
     const err = await hung.catch((e) => e);
     check(err instanceof ApiTimeoutError && err.phase === 'operation', 'error is ApiTimeoutError(phase=operation)');
+    check(err.code === API_ERROR_CODES.UPSTREAM_TIMEOUT && err.code === -32002, 'operation timeout → JSON-RPC code -32002');
+    check(err.data && err.data.retryable === false, 'operation timeout is not marked retryable (write may have applied)');
   }
 
   // ── 6. Hung write in a batch: rest of the batch still completes ────────────
@@ -174,6 +176,9 @@ async function settleWithin(p, ms) {
     const waiter = mgr.withSession(async () => 'waiter');
     const r = await settleWithin(waiter, 500);
     check(r.startsWith('rejected:Server busy'), 'waiter rejects with "Server busy"', r);
+    const e2 = await waiter.catch((x) => x);
+    check(e2 instanceof ApiTimeoutError && e2.code === -32001, 'lock-wait timeout → JSON-RPC code -32001', String(e2?.code));
+    check(e2?.data?.retryable === true && e2?.data?.retryAfterMs > 0, 'lock-wait error data: retryable + retryAfterMs');
     check(mgr.getState().lockWaiters === 0, 'timed-out waiter removed from the queue');
     check(await holder === 'holder', 'holder unaffected');
     check((await settleWithin(mgr.withSession(async () => 'later'), 500)) === 'done', 'later calls still acquire the lock');
@@ -257,6 +262,168 @@ async function settleWithin(p, ms) {
     await sleep(120);
     process.off('unhandledRejection', onUnhandled);
     check(!unhandled, 'late rejection of an abandoned operation is not unhandled');
+  }
+
+  // ══ Keep-alive mode ════════════════════════════════════════════════════════
+  /** Keep-alive manager with controllable sync failures and session key. */
+  function makeKeepAlive(overrides = {}) {
+    const stats = { init: 0, shutdown: 0, sync: 0, open: 0, maxOpen: 0 };
+    const ctl = { failSync: false, key: 'budget-a' };
+    const mgr = createApiSessionManager({
+      init: async () => { stats.init++; stats.open++; stats.maxOpen = Math.max(stats.maxOpen, stats.open); await sleep(5); },
+      shutdown: async () => { stats.shutdown++; stats.open = Math.max(0, stats.open - 1); await sleep(5); },
+      sync: async () => { stats.sync++; await sleep(2); if (ctl.failSync) throw new Error('sync failed'); },
+      sessionKey: () => ctl.key,
+      keepAliveMs: 150,
+      syncFreshnessMs: 0,
+      writeBatchDelayMs: 10,
+      timeouts: { lockWaitMs: 2000, initMs: 2000, operationMs: 2000, syncMs: 2000, shutdownMs: 2000 },
+      ...overrides,
+    });
+    return { mgr, stats, ctl };
+  }
+
+  console.log('\n[K1] Keep-alive: reads reuse one open session, refresh with sync, close when idle');
+  {
+    const { mgr, stats } = makeKeepAlive();
+    await mgr.withSession(async () => 1);
+    await mgr.withSession(async () => 2);
+    await mgr.withSession(async () => 3);
+    check(stats.init === 1, 'init (login + load) only once for 3 calls', JSON.stringify(stats));
+    check(stats.sync === 2, 'calls 2 and 3 refresh with sync()', JSON.stringify(stats));
+    check(stats.shutdown === 0 && mgr.getState().sessionOpen, 'session stays open between calls');
+    await sleep(300);
+    check(stats.shutdown === 1 && !mgr.getState().sessionOpen, 'session closed after keepAliveMs idle', JSON.stringify(stats));
+    await mgr.withSession(async () => 4);
+    check(stats.init === 2, 'next call after idle close reopens');
+    await mgr.close();
+  }
+
+  console.log('\n[K2] Keep-alive: refresh skipped inside the freshness window');
+  {
+    const { mgr, stats } = makeKeepAlive({ syncFreshnessMs: 10_000 });
+    await mgr.withSession(async () => 1);
+    await mgr.withSession(async () => 2);
+    check(stats.init === 1 && stats.sync === 0, 'second call within freshness window does no sync', JSON.stringify(stats));
+    await mgr.close();
+  }
+
+  console.log('\n[K3] Keep-alive: writes are synced (pushed) but the session stays open');
+  {
+    const { mgr, stats } = makeKeepAlive();
+    await Promise.all([mgr.queueWrite(async () => 'a'), mgr.queueWrite(async () => 'b')]);
+    await waitIdle(mgr);
+    check(stats.init === 1 && stats.shutdown === 0, 'one open, no shutdown', JSON.stringify(stats));
+    check(stats.sync === 1, 'one post-batch sync', JSON.stringify(stats));
+    await mgr.withSession(async () => 'read');
+    check(stats.init === 1, 'subsequent read reuses the session');
+    await mgr.close();
+    check(stats.shutdown === 1 && !mgr.getState().sessionOpen, 'close() shuts the session down');
+  }
+
+  console.log('\n[K4] Keep-alive: syncAfter forces a sync after a read-path mutation');
+  {
+    const { mgr, stats } = makeKeepAlive({ syncFreshnessMs: 10_000 });
+    await mgr.withSession(async () => 'bank sync', { syncAfter: true });
+    check(stats.sync === 1, 'sync ran after the operation', JSON.stringify(stats));
+    await mgr.close();
+  }
+
+  console.log('\n[K5] Keep-alive: budget switch reopens on the new budget');
+  {
+    const { mgr, stats, ctl } = makeKeepAlive();
+    await mgr.withSession(async () => 1);
+    ctl.key = 'budget-b';
+    await mgr.withSession(async () => 2);
+    check(stats.init === 2 && stats.shutdown === 1, 'old session closed, new one opened', JSON.stringify(stats));
+    check(stats.maxOpen === 1, 'never two sessions open');
+    await mgr.close();
+  }
+
+  console.log('\n[K6] Keep-alive: failed refresh sync (expired token, server restart) reopens');
+  {
+    const { mgr, stats, ctl } = makeKeepAlive();
+    await mgr.withSession(async () => 1);
+    ctl.failSync = true;
+    const r = await settleWithin(mgr.withSession(async () => 'after'), 1000);
+    check(r === 'done', 'call still succeeds', r);
+    check(stats.init === 2 && stats.shutdown === 1, 'session was reopened', JSON.stringify(stats));
+    ctl.failSync = false;
+    await mgr.close();
+  }
+
+  console.log('\n[K7] Keep-alive: failed post-write sync closes the session (shutdown pushes)');
+  {
+    const { mgr, stats, ctl } = makeKeepAlive();
+    await mgr.withSession(async () => 1);
+    ctl.failSync = true;
+    const w = await settleWithin(mgr.queueWrite(async () => 'w'), 1000);
+    await waitIdle(mgr);
+    check(w === 'done', 'write itself still resolves', w);
+    check(!mgr.getState().sessionOpen && stats.shutdown >= 1, 'session closed after failed sync', JSON.stringify(stats));
+    ctl.failSync = false;
+  }
+
+  console.log('\n[K8] Keep-alive: timeout closes the session; next call opens fresh');
+  {
+    const { mgr, stats } = makeKeepAlive({ timeouts: { operationMs: 80 } });
+    await mgr.withSession(async () => 1);
+    const r = await settleWithin(mgr.withSession(never), 500);
+    check(r.includes('timed out'), 'hung call times out', r);
+    check(!mgr.getState().sessionOpen && stats.shutdown === 1, 'session closed after timeout', JSON.stringify(stats));
+    await mgr.withSession(async () => 2);
+    check(stats.init === 2, 'next call reopened');
+    await mgr.close();
+  }
+
+  console.log('\n[K9] Keep-alive: ordinary error keeps the session but forces a health-check sync');
+  {
+    const { mgr, stats } = makeKeepAlive({ syncFreshnessMs: 10_000 });
+    await mgr.withSession(async () => 1);
+    await mgr.withSession(async () => { throw new Error('account not found'); }).catch(() => {});
+    check(mgr.getState().sessionOpen && stats.shutdown === 0, 'session still open after a normal error');
+    await mgr.withSession(async () => 2);
+    check(stats.sync === 1, 'next call syncs despite freshness window', JSON.stringify(stats));
+    await mgr.close();
+  }
+
+  console.log('\n[K10] Keep-alive: max session age forces a full reopen');
+  {
+    const { mgr, stats } = makeKeepAlive({ maxSessionAgeMs: 50 });
+    await mgr.withSession(async () => 1);
+    await sleep(80);
+    await mgr.withSession(async () => 2);
+    check(stats.init === 2 && stats.shutdown === 1, 'reopened after max age', JSON.stringify(stats));
+    await mgr.close();
+  }
+
+  console.log('\n[K11] Keep-alive: close() during a call defers until the call ends');
+  {
+    const { mgr, stats } = makeKeepAlive();
+    await mgr.withSession(async () => { await mgr.close(); check(stats.shutdown === 0, 'not closed mid-call'); });
+    check(stats.shutdown === 1 && !mgr.getState().sessionOpen, 'closed once the call finished');
+  }
+
+  console.log('\n[K12] Keep-alive: 60 concurrent mixed calls, one session, no overlap');
+  {
+    const { mgr, stats } = makeKeepAlive({ writeBatchDelayMs: 5 });
+    const calls = [];
+    for (let i = 0; i < 60; i++) {
+      calls.push(i % 3 === 0
+        ? mgr.queueWrite(async () => { await sleep(Math.random() * 3); return i; })
+        : mgr.withSession(async () => { await sleep(Math.random() * 3); return i; }));
+    }
+    check((await settleWithin(Promise.all(calls), 5000)) === 'done', 'all calls settle');
+    await waitIdle(mgr);
+    check(stats.init === 1 && stats.maxOpen === 1, 'single open session for the whole burst', JSON.stringify(stats));
+    await mgr.close();
+  }
+
+  console.log('\n[K13] keepAliveMs without a sync hook falls back to cold mode');
+  {
+    const { mgr, stats } = makeManager({ sync: undefined, keepAliveMs: 1000 });
+    await mgr.withSession(async () => 1);
+    check(!mgr.getState().keepAlive && stats.shutdown === 1, 'closed after the call', JSON.stringify(stats));
   }
 
   console.log(failures === 0 ? '\n✅ api_session tests passed' : `\n❌ ${failures} api_session test(s) failed`);

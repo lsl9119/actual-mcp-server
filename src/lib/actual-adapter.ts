@@ -65,7 +65,7 @@ import retry from './retry.js';
 import logger from '../logger.js';
 import config from '../config.js';
 import { parseBudgetRegistry, type BudgetConfig } from './budget-registry.js';
-import { createApiSessionManager } from './api-session.js';
+import { createApiSessionManager, ApiTimeoutError } from './api-session.js';
 import { BANK_SYNC_SETTLE_MS, DEFAULT_CONCURRENCY_LIMIT, WRITE_SESSION_DELAY_MS } from './constants.js';
 
 /**
@@ -120,8 +120,15 @@ const apiSession = createApiSessionManager({
     shutdownMs: config.ACTUAL_SHUTDOWN_TIMEOUT_MS,
   },
   writeBatchDelayMs: WRITE_SESSION_DELAY_MS,
+  keepAliveMs: config.ACTUAL_SESSION_KEEPALIVE_MS,
+  // A budget switch must reopen the kept-alive session on the new budget.
+  sessionKey: () => { const b = getActiveBudgetConfig(); return `${b.serverUrl}|${b.syncId}`; },
   logger,
 });
+
+if (config.ACTUAL_SESSION_KEEPALIVE_MS > 0) {
+  logger.info(`[ADAPTER] Session keep-alive enabled: budget stays open for ${config.ACTUAL_SESSION_KEEPALIVE_MS}ms after the last call`);
+}
 
 /**
  * Helper to init and shutdown Actual API around each operation
@@ -136,11 +143,18 @@ export function withActualApi<T>(operation: () => Promise<T>): Promise<T> {
 
 /**
  * Run fn while holding the API session lock, without opening a session.
- * Used by the connection pool for bare api.shutdown() calls so they can never
- * close a budget out from under an in-flight tool call.
  */
 export function runExclusiveApi<T>(fn: () => Promise<T>): Promise<T> {
   return apiSession.runExclusive(fn);
+}
+
+/**
+ * Shut the Actual API session down (api.shutdown → sync + close budget),
+ * waiting for any in-flight call first. Used on process shutdown / pool reset;
+ * never closes a budget out from under a running tool call.
+ */
+export function closeApiSession(): Promise<void> {
+  return apiSession.close();
 }
 
 /** Diagnostics: lock holder/waiters and pending writes. */
@@ -1130,7 +1144,9 @@ export function parseWhereClause(query: any, whereClause: string): any {
 }
 export async function runBankSync(accountId?: string): Promise<void> {
   try {
-    return await withActualApi(async () => {
+    // syncAfter: bank sync imports transactions on the read path, so push them
+    // right away when the session is kept alive.
+    return await apiSession.withSession(async () => {
       observability.incrementToolCall('actual.bank.sync').catch(() => {});
       // Bank sync must NOT be retried — retrying could import duplicate transactions.
       // Pass { accountId } for a specific account, or {} to sync all linked accounts.
@@ -1205,8 +1221,10 @@ export async function runBankSync(accountId?: string): Promise<void> {
       } finally {
         process.off('unhandledRejection', rejectionHandler);
       }
-    });
+    }, { syncAfter: true });
   } catch (error: any) {
+    // Session timeouts already carry a precise message and JSON-RPC code.
+    if (error instanceof ApiTimeoutError) throw error;
     const errorMsg = error?.message || String(error);
 
     // Network / connectivity errors (includes "fetch failed" from Node.js native fetch)

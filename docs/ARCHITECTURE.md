@@ -519,11 +519,12 @@ MCP_HTTPS_KEY=/app/certs/key.pem         # Private key path
 
 ```bash
 # Timeouts in milliseconds (integer; 0 disables that timeout)
-ACTUAL_LOCK_WAIT_TIMEOUT_MS=120000       # Max wait for the shared API session ("server busy")
+ACTUAL_LOCK_WAIT_TIMEOUT_MS=30000        # Max wait for the shared API session ("server busy", -32001)
 ACTUAL_INIT_TIMEOUT_MS=60000             # api.init() + downloadBudget()
 ACTUAL_OPERATION_TIMEOUT_MS=120000       # One read, or one write in a batch (must exceed 30s bank-sync settle)
 ACTUAL_SYNC_TIMEOUT_MS=60000             # api.sync() after a write batch
 ACTUAL_SHUTDOWN_TIMEOUT_MS=30000         # api.shutdown(); lock is released even if it hangs
+ACTUAL_SESSION_KEEPALIVE_MS=0            # Keep-alive idle window (ms); 0 = off (open/close per call). Suggested: 60000
 ```
 
 #### Logging
@@ -656,7 +657,9 @@ DEFAULT_CONCURRENCY_LIMIT = 5   // max simultaneous API calls
 
 ### API Session Coordinator
 
-`src/lib/api-session.ts` coordinates all access to the `@actual-app/api` singleton. Sessions are serialised by a FIFO lock with a wait timeout (`ACTUAL_LOCK_WAIT_TIMEOUT_MS`), and init/download, each operation, post-write sync and shutdown are each bounded by their own timeout, so a hung Actual server cannot freeze the MCP server; timeouts surface to the client as normal tool errors. The coordinator is re-entrant: nested adapter calls inside an open session run inline rather than deadlocking. Queued writes are batched so a write that arrives during a running write batch is never stranded. Connection pool init, session init and idle cleanup also go through this lock rather than calling `api.init()`/`api.shutdown()` directly.
+`src/lib/api-session.ts` coordinates all access to the `@actual-app/api` singleton. Sessions are serialised by a FIFO lock with a wait timeout (`ACTUAL_LOCK_WAIT_TIMEOUT_MS`), and init/download, each operation, post-write sync and shutdown are each bounded by their own timeout, so a hung Actual server cannot freeze the MCP server; timeouts surface to the client as JSON-RPC errors `-32001` / `-32002` (see below). The coordinator is re-entrant: nested adapter calls inside an open session run inline rather than deadlocking. Queued writes are batched so a write that arrives during a running write batch is never stranded. Connection pool init, session init and idle cleanup also go through this lock rather than calling `api.init()`/`api.shutdown()` directly.
+
+**Keep-alive mode** (`ACTUAL_SESSION_KEEPALIVE_MS` > 0) keeps the budget open between tool calls instead of running `api.init()` (login via `POST /account/login`), budget load and `api.shutdown()` around every call. Each call first runs `api.sync()` to pull outside changes (skipped if the last sync was under 1 s ago), and writes are followed by `api.sync()` to push them; the session closes after the idle window, after 30 minutes of age, on budget switch, on process exit, or after any timeout or failed sync, and is reopened on the next call. Persistence is unchanged in both modes. Lock-wait timeouts return JSON-RPC error `-32001` (server busy, always retryable, `error.data.retryAfterMs` = 5000); init, operation, sync and shutdown timeouts return `-32002` with `error.data.phase` set to the phase that timed out, and only an `init` timeout is marked retryable.
 
 ---
 
