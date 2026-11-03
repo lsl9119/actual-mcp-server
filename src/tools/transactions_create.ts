@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from '../../types/tool.d.js';
 import adapter from '../lib/actual-adapter.js';
 import { CommonSchemas } from '../lib/schemas/common.js';
+import { isApiTimeoutError } from '../lib/api-session.js';
 
 const InputSchema = z.object({
   account: CommonSchemas.accountId,
@@ -46,6 +47,7 @@ const tool: ToolDefinition = {
 
       return { success: true as const, id: maybeId };
     } catch (error) {
+      if (isApiTimeoutError(error)) throw error; // keep JSON-RPC code + data (-32001/-32002)
       const msg = error instanceof Error ? error.message : String(error);
       if (msg.toLowerCase().includes('not found') && msg.toLowerCase().includes('account')) {
         // Return structured error (not throw) so callers receive { success: false, error }

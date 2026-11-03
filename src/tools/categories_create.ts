@@ -3,6 +3,7 @@ import type { paths } from '../../generated/actual-client/types.js';
 import type { ToolDefinition } from '../../types/tool.d.js';
 import adapter from '../lib/actual-adapter.js';
 import { CommonSchemas } from '../lib/schemas/common.js';
+import { isApiTimeoutError } from '../lib/api-session.js';
 
 const InputSchema = z.object({ 
   name: CommonSchemas.name, 
@@ -57,6 +58,7 @@ const tool: ToolDefinition = {
         message: `Category "${input.name}" created successfully`
       };
     } catch (error) {
+      if (isApiTimeoutError(error)) throw error; // keep JSON-RPC code + data (-32001/-32002)
       const errorMessage = error instanceof Error ? error.message : String(error);
       
       // Provide helpful error messages for common issues

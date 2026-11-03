@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { ToolDefinition } from '../../types/tool.d.js';
 import adapter from '../lib/actual-adapter.js';
+import { isApiTimeoutError } from '../lib/api-session.js';
 
 const InputSchema = z.object({
   accountId: z.string().nullable().optional().describe('Optional account ID to sync a specific account. If omitted, syncs all linked accounts.'),
@@ -19,6 +20,7 @@ const tool: ToolDefinition = {
       await adapter.runBankSync(input.accountId ?? undefined);
       return { result: 'Bank sync initiated successfully' };
     } catch (error) {
+      if (isApiTimeoutError(error)) throw error; // keep JSON-RPC code + data (-32001/-32002)
       const msg = error instanceof Error ? error.message : String(error);
       throw new Error(msg);
     }

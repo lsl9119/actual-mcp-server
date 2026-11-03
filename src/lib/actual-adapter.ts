@@ -65,7 +65,8 @@ import retry from './retry.js';
 import logger from '../logger.js';
 import config from '../config.js';
 import { parseBudgetRegistry, type BudgetConfig } from './budget-registry.js';
-import { createApiSessionManager, ApiTimeoutError } from './api-session.js';
+import { createApiSessionManager, ApiTimeoutError, isApiTimeoutError } from './api-session.js';
+export { isApiTimeoutError };
 import { BANK_SYNC_SETTLE_MS, DEFAULT_CONCURRENCY_LIMIT, WRITE_SESSION_DELAY_MS } from './constants.js';
 
 /**
@@ -109,7 +110,7 @@ function getActiveBudgetConfig(): BudgetConfig {
  * deadlocking. See src/lib/api-session.ts.
  */
 const apiSession = createApiSessionManager({
-  init: () => initActualApiForOperation(),
+  init: (signal) => initActualApiForOperation(signal),
   shutdown: () => shutdownActualApi(),
   sync: () => (api as any).sync(),
   timeouts: {
@@ -166,7 +167,7 @@ export function getApiSessionState() {
  * Initialize Actual API - based on s-stefanov/actual-mcp pattern
  * This calls api.init() and api.downloadBudget() for each operation
  */
-async function initActualApiForOperation(): Promise<void> {
+async function initActualApiForOperation(signal?: AbortSignal): Promise<void> {
   try {
     const budget = getActiveBudgetConfig();
     const DATA_DIR = config.MCP_BRIDGE_DATA_DIR;
@@ -178,6 +179,10 @@ async function initActualApiForOperation(): Promise<void> {
       serverURL: budget.serverUrl,
       password: budget.password || '',
     });
+
+    // If init timed out while api.init() was still logging in, the session
+    // coordinator may already be serving the next caller: don't load a budget.
+    if (signal?.aborted) throw new Error('Actual API init abandoned after timeout');
 
     logger.debug('[ADAPTER] Downloading budget');
 
@@ -1071,6 +1076,7 @@ export async function runQuery(queryString: string | any): Promise<unknown> {
   });
   } catch (error: any) {
     // Top-level catch to ensure no unhandled rejections escape
+    if (isApiTimeoutError(error)) throw error; // keep JSON-RPC code + data
     const errorMsg = error?.message || String(error);
     logger.error(`[ADAPTER] Query execution failed: ${errorMsg}`);
     

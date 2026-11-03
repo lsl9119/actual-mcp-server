@@ -116,7 +116,7 @@ async function settleWithin(p, ms) {
   // ── 5. Hung operation releases the lock ────────────────────────────────────
   console.log('\n[5] Hung read operation times out and releases the session');
   {
-    const { mgr, stats } = makeManager({ timeouts: { operationMs: 100, lockWaitMs: 2000 } });
+    const { mgr, stats } = makeManager({ timeouts: { operationMs: 100, lockWaitMs: 2000, shutdownMs: 100 } });
     const hung = mgr.withSession(never);
     const next = mgr.withSession(async () => 'next');
     const r = await settleWithin(hung, 500);
@@ -132,7 +132,7 @@ async function settleWithin(p, ms) {
   // ── 6. Hung write in a batch: rest of the batch still completes ────────────
   console.log('\n[6] Hung write times out without blocking its batch');
   {
-    const { mgr, stats } = makeManager({ timeouts: { operationMs: 100 } });
+    const { mgr, stats } = makeManager({ timeouts: { operationMs: 100, shutdownMs: 100 } });
     const hung = mgr.queueWrite(never);
     const after = mgr.queueWrite(async () => 'after');
     check((await settleWithin(hung, 500)).includes('timed out'), 'hung write rejects with timeout');
@@ -147,7 +147,7 @@ async function settleWithin(p, ms) {
     let hangInit = true;
     const { mgr } = makeManager({
       init: async () => { if (hangInit) await never(); },
-      timeouts: { initMs: 100 },
+      timeouts: { initMs: 100, shutdownMs: 100 },
     });
     const r1 = await settleWithin(mgr.withSession(async () => 'read'), 500);
     check(r1.startsWith('rejected:') && r1.includes('ACTUAL_SERVER_URL'), 'read rejects with an init timeout hint', r1);
@@ -366,7 +366,7 @@ async function settleWithin(p, ms) {
 
   console.log('\n[K8] Keep-alive: timeout closes the session; next call opens fresh');
   {
-    const { mgr, stats } = makeKeepAlive({ timeouts: { operationMs: 80 } });
+    const { mgr, stats } = makeKeepAlive({ timeouts: { operationMs: 80, shutdownMs: 100 } });
     await mgr.withSession(async () => 1);
     const r = await settleWithin(mgr.withSession(never), 500);
     check(r.includes('timed out'), 'hung call times out', r);
@@ -424,6 +424,73 @@ async function settleWithin(p, ms) {
     const { mgr, stats } = makeManager({ sync: undefined, keepAliveMs: 1000 });
     await mgr.withSession(async () => 1);
     check(!mgr.getState().keepAlive && stats.shutdown === 1, 'closed after the call', JSON.stringify(stats));
+  }
+
+  // ── P1 (PR review): an abandoned slow init must not touch the singleton ────
+  console.log('\n[P1] Timed-out init cannot load a budget under the next session');
+  {
+    const ev = [];
+    let initsRunning = 0, maxInitsRunning = 0, n = 0;
+    const mgr = createApiSessionManager({
+      init: async (signal) => {
+        const id = ++n;
+        initsRunning++; maxInitsRunning = Math.max(maxInitsRunning, initsRunning);
+        try {
+          await sleep(id === 1 ? 150 : 5);          // api.init(): first one is slow, not hung
+          if (signal.aborted) { ev.push(`init${id}:aborted`); throw new Error('abandoned'); }
+          ev.push(`init${id}:download`);             // downloadBudget() would replace the open budget
+        } finally { initsRunning--; }
+      },
+      shutdown: async () => { ev.push('shutdown'); },
+      timeouts: { initMs: 50, shutdownMs: 1000, lockWaitMs: 2000, operationMs: 2000 },
+    });
+    const a = mgr.withSession(async () => 'a');
+    const b = mgr.withSession(async () => { ev.push('b:op'); return 'b'; });
+    const ra = await settleWithin(a, 1000);
+    check(ra.includes('Timed out after 50ms'), 'first call fails with an init timeout', ra);
+    check((await settleWithin(b, 1000)) === 'done', 'second call succeeds');
+    check(maxInitsRunning === 1, 'the next init never overlapped the abandoned one', String(maxInitsRunning));
+    check(!ev.includes('init1:download') && ev.includes('init1:aborted'), 'abandoned init stopped before downloading', ev.join(','));
+    check(ev.indexOf('init1:aborted') < ev.indexOf('init2:download') && ev.indexOf('init2:download') < ev.indexOf('b:op'),
+      'order: abandoned init settles → next session opens → its operation runs', ev.join(','));
+  }
+
+  console.log('\n[P1b] Abandoned work that never settles only delays the lock by the grace period');
+  {
+    const { mgr } = makeManager({ timeouts: { operationMs: 50, shutdownMs: 150, lockWaitMs: 2000 } });
+    const t0 = Date.now();
+    const hung = mgr.withSession(never).catch(() => {});
+    const next = mgr.withSession(async () => Date.now() - t0);
+    await hung;
+    const waited = await next;
+    check(waited >= 190 && waited < 1000, 'next call ran after timeout + grace (~200ms), not never', `${waited}ms`);
+  }
+
+  // ── P2 (PR review): tool wrappers keep the JSON-RPC code + data ────────────
+  console.log('\n[P2] Tool wrappers rethrow ApiTimeoutError unchanged');
+  {
+    process.env.ACTUAL_SERVER_URL ??= 'http://localhost:5006';
+    process.env.ACTUAL_BUDGET_SYNC_ID ??= '00000000-0000-0000-0000-000000000000';
+    process.env.ACTUAL_PASSWORD ??= 'stub-password-for-unit-test';
+    const adapter = (await import('../../dist/src/lib/actual-adapter.js')).default;
+    const busy = () => { const e = new ApiTimeoutError('lock-wait', 30000, 'Server busy: test'); return Promise.reject(e); };
+    const UUID = '11111111-1111-1111-1111-111111111111';
+    const cases = [
+      ['bank_sync', 'runBankSync', {}],
+      ['budgets_setAmount', 'setBudgetAmount', { month: '2026-01', categoryId: UUID, amount: 100 }],
+      ['transactions_create', 'addTransactions', { account: UUID, date: '2026-01-15', amount: -100 }],
+      ['categories_create', 'createCategory', { name: 'X', group_id: UUID }],
+      ['query_run', 'runQuery', { query: 'SELECT id FROM accounts' }],
+    ];
+    for (const [file, method, args] of cases) {
+      const tool = (await import(`../../dist/src/tools/${file}.js`)).default;
+      const orig = adapter[method];
+      adapter[method] = busy;
+      let err;
+      try { await (tool.call ? tool.call(args) : tool.handler(args)); } catch (e) { err = e; }
+      adapter[method] = orig;
+      check(err?.code === -32001 && err?.data?.retryable === true, `${file}: error keeps code -32001 + data`, `${err?.code} ${err?.message}`);
+    }
   }
 
   console.log(failures === 0 ? '\n✅ api_session tests passed' : `\n❌ ${failures} api_session test(s) failed`);

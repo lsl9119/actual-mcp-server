@@ -68,8 +68,12 @@ interface SessionLogger {
 const noopLogger: SessionLogger = { debug: () => {}, warn: () => {}, error: () => {} };
 
 export interface ApiSessionOptions {
-  /** Opens the API session (api.init + downloadBudget). */
-  init: () => Promise<void>;
+  /**
+   * Opens the API session (api.init + downloadBudget). The signal is aborted
+   * when the init times out: an abandoned init must check it between SDK calls
+   * so it cannot touch the singleton once another session may own it.
+   */
+  init: (signal: AbortSignal) => Promise<void>;
   /** Closes the API session (api.shutdown). Must persist local changes. */
   shutdown: () => Promise<void>;
   /** Exchanges changes with the server (api.sync). Required for keep-alive. */
@@ -152,9 +156,27 @@ export function withTimeout<T>(work: Promise<T>, ms: number, phase: ApiTimeoutPh
   return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
 }
 
+/** True for session timeouts, including after a cross-module boundary. */
+export function isApiTimeoutError(err: unknown): err is ApiTimeoutError {
+  return err instanceof ApiTimeoutError ||
+    (typeof err === 'object' && err !== null && (err as { name?: unknown }).name === 'ApiTimeoutError');
+}
+
 /** Runs fn, converting a synchronous throw into a rejected promise. */
 function invoke<T>(fn: () => Promise<T>): Promise<T> {
   return Promise.resolve().then(fn);
+}
+
+/**
+ * withTimeout, but if the timer wins the still-running work is recorded on the
+ * session context so the lock is not handed to the next session while it can
+ * still touch the singleton.
+ */
+function guarded<T>(ctx: SessionContext, work: Promise<T>, ms: number, phase: ApiTimeoutPhase): Promise<T> {
+  return withTimeout(work, ms, phase).catch((err) => {
+    if (err instanceof ApiTimeoutError) ctx.abandoned.push(work.catch(() => {}));
+    throw err;
+  });
 }
 
 /** FIFO mutex whose waiters can give up after a timeout. */
@@ -208,6 +230,8 @@ interface SessionContext {
   active: boolean;
   /** Close (shutdown) the session when this call finishes, even in keep-alive mode. */
   closeAfter: boolean;
+  /** SDK work that timed out but may still be running against the singleton. */
+  abandoned: Promise<unknown>[];
 }
 
 interface QueuedWrite {
@@ -300,7 +324,7 @@ export function createApiSessionManager(options: ApiSessionOptions): ApiSessionM
   }
 
   /** Must be called with the lock held. Opens, or refreshes a kept-alive session. */
-  async function ensureOpen(): Promise<void> {
+  async function ensureOpen(ctx: SessionContext): Promise<void> {
     const key = currentKey();
     if (open) {
       if (openKey !== key) {
@@ -320,7 +344,13 @@ export function createApiSessionManager(options: ApiSessionOptions): ApiSessionM
         }
       }
     }
-    await withTimeout(invoke(options.init), t.initMs, 'init');
+    const abort = new AbortController();
+    try {
+      await guarded(ctx, invoke(() => options.init(abort.signal)), t.initMs, 'init');
+    } catch (err) {
+      abort.abort(); // an abandoned init must not go on to load a budget
+      throw err;
+    }
     open = true;
     openKey = key;
     openedAt = lastSyncAt = Date.now();
@@ -356,6 +386,26 @@ export function createApiSessionManager(options: ApiSessionOptions): ApiSessionM
   }
 
   /**
+   * Before handing the lock on, give timed-out SDK work a bounded chance to
+   * finish so it can't run against the singleton during the next session.
+   */
+  async function drainAbandoned(ctx: SessionContext): Promise<void> {
+    ctx.closeAfter = true;
+    const grace = t.shutdownMs;
+    let timer: NodeJS.Timeout | undefined;
+    const settled = await Promise.race([
+      Promise.allSettled(ctx.abandoned).then(() => true),
+      ...(Number.isFinite(grace) && grace > 0
+        ? [new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), grace); })]
+        : []),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (!settled) {
+      log.warn(`[API SESSION] Timed-out SDK work still running after ${grace}ms grace; releasing the session anyway`);
+    }
+  }
+
+  /**
    * Acquire the lock and run body inside a session context. Cold mode: always
    * shut down afterwards. Keep-alive: leave the session open unless the call
    * asked for (or failed in a way that needs) a clean reopen.
@@ -363,7 +413,7 @@ export function createApiSessionManager(options: ApiSessionOptions): ApiSessionM
   async function runLocked<T>(body: (ctx: SessionContext) => Promise<T>): Promise<T> {
     const release = await mutex.acquire(t.lockWaitMs);
     clearIdleTimer();
-    const ctx: SessionContext = { active: true, closeAfter: false };
+    const ctx: SessionContext = { active: true, closeAfter: false, abandoned: [] };
     lockHeldSince = Date.now();
     try {
       return await als.run(ctx, () => body(ctx));
@@ -373,6 +423,7 @@ export function createApiSessionManager(options: ApiSessionOptions): ApiSessionM
       throw err;
     } finally {
       ctx.active = false;
+      if (ctx.abandoned.length > 0) await drainAbandoned(ctx);
       if (!keepAlive || ctx.closeAfter) {
         await closeNow();
       } else {
@@ -387,8 +438,8 @@ export function createApiSessionManager(options: ApiSessionOptions): ApiSessionM
   function withSession<T>(operation: () => Promise<T>, callOptions: SessionCallOptions = {}): Promise<T> {
     if (inSession()) return invoke(operation); // re-entrant: reuse the open session
     return runLocked(async (ctx) => {
-      await ensureOpen();
-      const result = await withTimeout(invoke(operation), t.operationMs, 'operation');
+      await ensureOpen(ctx);
+      const result = await guarded(ctx, invoke(operation), t.operationMs, 'operation');
       if (keepAlive && callOptions.syncAfter) {
         try {
           await syncNow();
@@ -407,7 +458,7 @@ export function createApiSessionManager(options: ApiSessionOptions): ApiSessionM
     try {
       await runLocked(async (ctx) => {
         try {
-          await ensureOpen();
+          await ensureOpen(ctx);
         } catch (err) {
           log.error('[WRITE QUEUE] Session init failed; rejecting batch:', err);
           for (const w of batch) w.reject(err);
@@ -418,7 +469,7 @@ export function createApiSessionManager(options: ApiSessionOptions): ApiSessionM
         // concurrent writes inside a session have caused contention issues.
         for (const w of batch) {
           try {
-            w.resolve(await withTimeout(invoke(w.operation), t.operationMs, 'operation'));
+            w.resolve(await guarded(ctx, invoke(w.operation), t.operationMs, 'operation'));
           } catch (err) {
             log.error('[WRITE QUEUE] Operation failed:', err);
             if (err instanceof ApiTimeoutError) ctx.closeAfter = true;
