@@ -122,6 +122,7 @@
 | **Tool Manager** | `src/actualToolsManager.ts` | Tool registry and dispatch | `registerTools()`, `callTool()` |
 | **MCP Connection** | `src/lib/ActualMCPConnection.ts` | MCP protocol implementation | `handleToolCall()`, `handleRequest()` |
 | **Adapter Layer** | `src/lib/actual-adapter.ts` | API wrapper with error handling | All Actual API functions |
+| **API Session Coordinator** | `src/lib/api-session.ts` | Serialises and time-bounds all access to the `@actual-app/api` singleton | `createApiSessionManager()`, `withTimeout()` |
 | **Configuration** | `src/config.ts` | Environment validation | `config`, `configSchema` |
 | **Logger** | `src/logger.ts` | Structured logging | `logger` singleton |
 | **Observability** | `src/observability.ts` | Metrics collection | `incrementToolCall()`, `getMetricsText()` |
@@ -300,6 +301,7 @@ actual-mcp-server/
 │   │
 │   ├── lib/                      # Core libraries
 │   │   ├── actual-adapter.ts     # Actual API wrapper (withActualApi, callWithRetry)
+│   │   ├── api-session.ts        # Session coordinator: FIFO lock, timeouts, re-entrancy
 │   │   ├── actual-schema.ts      # Shared Zod schema definitions
 │   │   ├── ActualConnectionPool.ts # Connection pool management
 │   │   ├── ActualMCPConnection.ts  # MCP protocol handler (EventEmitter-based)
@@ -513,6 +515,17 @@ MCP_HTTPS_CERT=/app/certs/cert.pem       # Certificate path
 MCP_HTTPS_KEY=/app/certs/key.pem         # Private key path
 ```
 
+#### API Session Timeouts
+
+```bash
+# Timeouts in milliseconds (integer; 0 disables that timeout)
+ACTUAL_LOCK_WAIT_TIMEOUT_MS=120000       # Max wait for the shared API session ("server busy")
+ACTUAL_INIT_TIMEOUT_MS=60000             # api.init() + downloadBudget()
+ACTUAL_OPERATION_TIMEOUT_MS=120000       # One read, or one write in a batch (must exceed 30s bank-sync settle)
+ACTUAL_SYNC_TIMEOUT_MS=60000             # api.sync() after a write batch
+ACTUAL_SHUTDOWN_TIMEOUT_MS=30000         # api.shutdown(); lock is released even if it hangs
+```
+
 #### Logging
 
 ```bash
@@ -640,6 +653,10 @@ DEFAULT_CONCURRENCY_LIMIT = 5   // max simultaneous API calls
 // Overflow requests are queued and drained FIFO
 // Configurable via ACTUAL_API_CONCURRENCY env var
 ```
+
+### API Session Coordinator
+
+`src/lib/api-session.ts` coordinates all access to the `@actual-app/api` singleton. Sessions are serialised by a FIFO lock with a wait timeout (`ACTUAL_LOCK_WAIT_TIMEOUT_MS`), and init/download, each operation, post-write sync and shutdown are each bounded by their own timeout, so a hung Actual server cannot freeze the MCP server; timeouts surface to the client as normal tool errors. The coordinator is re-entrant: nested adapter calls inside an open session run inline rather than deadlocking. Queued writes are batched so a write that arrives during a running write batch is never stranded. Connection pool init, session init and idle cleanup also go through this lock rather than calling `api.init()`/`api.shutdown()` directly.
 
 ---
 

@@ -422,6 +422,11 @@ All configuration is via environment variables. Copy `.env.example` to `.env` to
 | `USE_CONNECTION_POOL` | `true` | No | Enable session-based connection pooling |
 | `MAX_CONCURRENT_SESSIONS` | `15` | No | Maximum concurrent MCP sessions allowed |
 | `SESSION_IDLE_TIMEOUT_MINUTES` | `5` (pool) / `2` (HTTP) | No | Minutes before idle session cleanup |
+| `ACTUAL_LOCK_WAIT_TIMEOUT_MS` | `120000` | No | Max ms a request waits for the shared Actual API session before failing with a "server busy" error (`0` disables) |
+| `ACTUAL_INIT_TIMEOUT_MS` | `60000` | No | Max ms for `api.init()` + `downloadBudget()` (`0` disables) |
+| `ACTUAL_OPERATION_TIMEOUT_MS` | `120000` | No | Max ms for one operation (a read, or one write in a batch). Must exceed the 30s bank-sync settle window (`0` disables) |
+| `ACTUAL_SYNC_TIMEOUT_MS` | `60000` | No | Max ms for `api.sync()` after a write batch (`0` disables) |
+| `ACTUAL_SHUTDOWN_TIMEOUT_MS` | `30000` | No | Max ms for `api.shutdown()`; the lock is released even if shutdown hangs (`0` disables) |
 | **Security & Authentication** ||||
 | `AUTH_PROVIDER` | `none` | No | Auth mode: `none` (static Bearer) or `oidc` (JWKS-validated JWT) |
 | `MCP_SSE_AUTHORIZATION` | — | No | Static Bearer token (`AUTH_PROVIDER=none`; highly recommended in production) |

@@ -65,6 +65,8 @@ import retry from './retry.js';
 import logger from '../logger.js';
 import config from '../config.js';
 import { parseBudgetRegistry, type BudgetConfig } from './budget-registry.js';
+import { createApiSessionManager } from './api-session.js';
+import { BANK_SYNC_SETTLE_MS, DEFAULT_CONCURRENCY_LIMIT, WRITE_SESSION_DELAY_MS } from './constants.js';
 
 /**
  * Budget registry — all budgets configured via ACTUAL_* and BUDGET_n_* env vars.
@@ -97,34 +99,53 @@ function getActiveBudgetConfig(): BudgetConfig {
 }
 
 /**
- * Global API session mutex.
+ * Global API session coordinator.
  * @actual-app/api is a singleton with a single SQLite connection — concurrent
- * init/shutdown pairs corrupt the session.  All callers (reads via withActualApi,
- * writes via processWriteQueue) must acquire this lock before touching the API.
+ * init/shutdown pairs corrupt the session. Every touch of the API (reads via
+ * withActualApi, writes via queueWriteOperation, and the connection pool's
+ * init/shutdown via runExclusiveApi) goes through this coordinator, which
+ * serialises sessions, bounds every phase with a timeout so a hung call can't
+ * freeze the server, and lets nested calls reuse the open session instead of
+ * deadlocking. See src/lib/api-session.ts.
  */
-let _apiSessionLock: Promise<void> = Promise.resolve();
-
-function withApiLock<T>(fn: () => Promise<T>): Promise<T> {
-  let release!: () => void;
-  const prevLock = _apiSessionLock;
-  _apiSessionLock = new Promise<void>(resolve => { release = resolve; });
-  return prevLock.then(() => fn()).finally(() => release());
-}
+const apiSession = createApiSessionManager({
+  init: () => initActualApiForOperation(),
+  shutdown: () => shutdownActualApi(),
+  sync: () => (api as any).sync(),
+  timeouts: {
+    lockWaitMs: config.ACTUAL_LOCK_WAIT_TIMEOUT_MS,
+    initMs: config.ACTUAL_INIT_TIMEOUT_MS,
+    operationMs: config.ACTUAL_OPERATION_TIMEOUT_MS,
+    syncMs: config.ACTUAL_SYNC_TIMEOUT_MS,
+    shutdownMs: config.ACTUAL_SHUTDOWN_TIMEOUT_MS,
+  },
+  writeBatchDelayMs: WRITE_SESSION_DELAY_MS,
+  logger,
+});
 
 /**
  * Helper to init and shutdown Actual API around each operation
  * This is CRITICAL for data persistence - shutdown() must be called after every operation
  * Based on the pattern from https://github.com/s-stefanov/actual-mcp
+ *
+ * Safe to nest: a call from inside an open session (read or write) runs in that session.
  */
-async function withActualApi<T>(operation: () => Promise<T>): Promise<T> {
-  return withApiLock(async () => {
-    try {
-      await initActualApiForOperation();
-      return await operation();
-    } finally {
-      await shutdownActualApi();
-    }
-  });
+export function withActualApi<T>(operation: () => Promise<T>): Promise<T> {
+  return apiSession.withSession(operation);
+}
+
+/**
+ * Run fn while holding the API session lock, without opening a session.
+ * Used by the connection pool for bare api.shutdown() calls so they can never
+ * close a budget out from under an in-flight tool call.
+ */
+export function runExclusiveApi<T>(fn: () => Promise<T>): Promise<T> {
+  return apiSession.runExclusive(fn);
+}
+
+/** Diagnostics: lock holder/waiters and pending writes. */
+export function getApiSessionState() {
+  return apiSession.getState();
 }
 
 /**
@@ -172,8 +193,6 @@ async function shutdownActualApi(): Promise<void> {
   }
 }
 
-import { BANK_SYNC_SETTLE_MS, DEFAULT_CONCURRENCY_LIMIT, WRITE_SESSION_DELAY_MS } from './constants.js';
-
 /**
  * Very small concurrency limiter for adapter calls. This prevents bursts from
  * overloading the actual server. It's intentionally tiny and in-memory; replace
@@ -184,106 +203,12 @@ let running = 0;
 const queue: Array<() => void> = [];
 
 /**
- * Write operation queue with budget session management
- * This ensures write operations share a single budget session to avoid race conditions
+ * Queue a write. Writes that arrive within WRITE_SESSION_DELAY_MS share one
+ * budget session (init → writes → sync → shutdown). Safe to call from inside
+ * an open session — it then runs immediately in that session.
  */
-interface WriteOperation<T> {
-  operation: () => Promise<T>;
-  resolve: (value: T) => void;
-  reject: (error: any) => void;
-}
-
-let writeQueue: WriteOperation<any>[] = [];
-let isProcessingWrites = false;
-let writeSessionTimeout: NodeJS.Timeout | null = null;
-
-async function processWriteQueue() {
-  // Atomically check and set processing flag to prevent race conditions
-  if (isProcessingWrites || writeQueue.length === 0) return;
-  isProcessingWrites = true;
-  
-  // Clear the timeout since we're processing now
-  if (writeSessionTimeout) {
-    clearTimeout(writeSessionTimeout);
-    writeSessionTimeout = null;
-  }
-  
-  const batch = writeQueue.splice(0, writeQueue.length); // Take all current items
-  logger.debug(`[WRITE QUEUE] Processing batch of ${batch.length} operations`);
-
-  try {
-    await withApiLock(async () => {
-      try {
-        // Initialize API once for all queued writes
-        await initActualApiForOperation();
-
-        // Process all queued writes in the same session
-        // Each operation handles its own success/failure
-        await Promise.allSettled(
-          batch.map(async ({ operation, resolve, reject }) => {
-            try {
-              const result = await operation();
-              resolve(result);
-            } catch (error) {
-              logger.error('[WRITE QUEUE] Operation failed:', error);
-              reject(error);
-            }
-          })
-        );
-
-        // Explicitly sync changes to server before shutdown
-        // This ensures all write operations are persisted
-        logger.debug(`[WRITE QUEUE] Syncing ${batch.length} operations to server`);
-        try {
-          await (api as any).sync();
-          logger.debug(`[WRITE QUEUE] Sync completed`);
-        } catch (syncError) {
-          logger.error('[WRITE QUEUE] Sync failed:', syncError);
-          // Don't throw - we still want to shutdown cleanly
-          // Individual operation errors were already reported to callers
-        }
-
-        // Shutdown after all writes complete and sync
-        await shutdownActualApi();
-        logger.debug(`[WRITE QUEUE] Batch completed successfully`);
-      } catch (error) {
-        logger.error('[WRITE QUEUE] Fatal error in write queue:', error);
-        // Reject any operations that weren't processed
-        batch.forEach(({ reject }) => {
-          try {
-            reject(error);
-          } catch (e) {
-            logger.error('[WRITE QUEUE] Error rejecting operation:', e);
-          }
-        });
-        await shutdownActualApi();
-      }
-    });
-  } finally {
-    isProcessingWrites = false;
-    // Process any new operations that were queued while we were processing
-    if (writeQueue.length > 0 && writeSessionTimeout === null) {
-      writeSessionTimeout = setTimeout(() => {
-        processWriteQueue();
-      }, WRITE_SESSION_DELAY_MS);
-    }
-  }
-}
-
 function queueWriteOperation<T>(operation: () => Promise<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    writeQueue.push({ operation, resolve, reject });
-    
-    // Clear existing timeout
-    if (writeSessionTimeout) {
-      clearTimeout(writeSessionTimeout);
-    }
-    
-    // Set new timeout to process queue
-    writeSessionTimeout = setTimeout(() => {
-      processWriteQueue();
-    }, WRITE_SESSION_DELAY_MS);
-  });
+  return apiSession.queueWrite(operation);
 }
 
 function processQueue() {
@@ -325,7 +250,7 @@ function withConcurrency<T>(fn: () => Promise<T>): Promise<T> {
 
 // Expose some helpers for testing concurrency
 export function getConcurrencyState() {
-  return { running, queueLength: queue.length, maxConcurrency: MAX_CONCURRENCY };
+  return { running, queueLength: queue.length, maxConcurrency: MAX_CONCURRENCY, session: apiSession.getState() };
 }
 
 /**

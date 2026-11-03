@@ -213,6 +213,7 @@ GitHub Actions automatically runs:
 | `transactions_create.test.js` | Zod schema — valid input accepted, empty input rejected |
 | `generated_tools.smoke.test.js` | All 63 tools: stub adapter, call succeeds, response shape correct |
 | `schema_validation.test.js` | Negative-path schemas: `rules_create`, `budget_updates_batch`, `budgets_transfer`, `budgets_setAmount` |
+| `api_session.test.js` | API session coordinator: write-queue stranding regression, lock-wait/init/operation/shutdown timeouts, re-entrancy (no nested deadlock), sequential batches, sync once per batch |
 
 **Run**:
 ```bash
@@ -639,6 +640,7 @@ This project follows a comprehensive testing strategy with multiple levels, from
 | `transactions_create.test.js` | Zod schema for `transactions_create`: valid input accepted, empty rejected | 2 |
 | `generated_tools.smoke.test.js` | All 63 tools: stub adapter, `call()` succeeds, response shape verified per-tool | 63 + shape checks |
 | `schema_validation.test.js` | Negative-path schema + runtime guards for 11+ tool schemas | 60+ |
+| `api_session.test.js` | API session coordinator: write-queue stranding regression, lock-wait/init/operation/shutdown timeouts, re-entrancy (no nested deadlock), sequential batches, sync once per batch | — |
 
 **Coverage:**
 - ✅ All 63 tools: stub invocation + response-shape assertion

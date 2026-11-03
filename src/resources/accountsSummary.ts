@@ -1,7 +1,6 @@
 // Example resource: summary of all accounts
-import api from '@actual-app/api';
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const { getAccounts } = api as any;
+// Goes through the adapter so the read runs inside a locked init/shutdown session.
+import { getAccounts } from '../lib/actual-adapter.js';
 import type { components } from '../../generated/actual-client/types.js';
 
 export async function accountsSummary(): Promise<Array<{ id?: string; name?: string; balance?: number }>> {
