@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { ToolDefinition } from '../../types/tool.d.js';
 import adapter from '../lib/actual-adapter.js';
+import { isApiTimeoutError } from '../lib/api-session.js';
 
 const InputSchema = z.object({ month: z.string().min(1), categoryId: z.string().min(1), amount: z.number() });
 
@@ -14,6 +15,7 @@ const tool: ToolDefinition = {
       const result = await adapter.setBudgetAmount(input.month, input.categoryId, input.amount);
       return { result };
     } catch (error) {
+      if (isApiTimeoutError(error)) throw error; // keep JSON-RPC code + data (-32001/-32002)
       const msg = error instanceof Error ? error.message : String(error);
       // The pre-flight in adapter.setBudgetAmount throws:
       //   Category "${categoryId}" not found. Use actual_categories_get to list available categories.

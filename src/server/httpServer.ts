@@ -12,6 +12,7 @@ import {
 import logger from '../logger.js';
 import { getLocalIp } from '../utils.js';
 import actualToolsManager from '../actualToolsManager.js';
+import { getApiSessionState } from '../lib/actual-adapter.js';
 import { getConnectionState, connectToActualForSession, shutdownActualForSession, shutdownActual, canAcceptNewSession } from '../actualConnection.js';
 import observability from '../observability.js';
 import config from '../config.js';
@@ -552,7 +553,9 @@ export async function startHttpServer(
       ...state, 
       transport: 'streamable-http', 
       activeSessions: transports.size,
-      connectionPool: poolStats
+      connectionPool: poolStats,
+      // Lock holder/waiters, pending writes, keep-alive session state
+      apiSession: getApiSessionState(),
     });
   });
 

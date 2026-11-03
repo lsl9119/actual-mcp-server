@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { ToolDefinition } from '../../types/tool.d.js';
 import adapter from '../lib/actual-adapter.js';
+import { isApiTimeoutError } from '../lib/api-session.js';
 
 const InputSchema = z.object({
   query: z.string().min(1).describe('ActualQL query string to execute'),
@@ -60,6 +61,7 @@ For details: https://actualbudget.org/docs/api/actual-ql/`,
       const result = await adapter.runQuery(input.query);
       return { result };
     } catch (error: any) {
+      if (isApiTimeoutError(error)) throw error; // keep JSON-RPC code + data (-32001/-32002)
       // Provide helpful error messages
       const errorMessage = error?.message || String(error);
       

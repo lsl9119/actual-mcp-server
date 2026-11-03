@@ -15,6 +15,20 @@ export const configSchema = z.object({
   MCP_HTTPS_KEY: z.string().optional(),
   MAX_CONCURRENT_SESSIONS: z.string().default('15').transform(val => parseInt(val, 10)),
 
+  // --- Actual API session timeouts (ms; 0 disables) ---
+  // All tool calls share one @actual-app/api session at a time. These bound how
+  // long a request may wait for, or hold, that session so a hung Actual server
+  // or SDK call can never freeze the whole MCP server.
+  ACTUAL_LOCK_WAIT_TIMEOUT_MS: z.coerce.number().int().min(0).default(30000),
+  ACTUAL_INIT_TIMEOUT_MS: z.coerce.number().int().min(0).default(60000),
+  ACTUAL_OPERATION_TIMEOUT_MS: z.coerce.number().int().min(0).default(120000),
+  ACTUAL_SYNC_TIMEOUT_MS: z.coerce.number().int().min(0).default(60000),
+  ACTUAL_SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(0).default(30000),
+  // Keep the budget open this long after the last tool call instead of
+  // init (login) + load + shutdown around every call. Each call then only runs
+  // api.sync(). 0 (default) = close after every call, the original behaviour.
+  ACTUAL_SESSION_KEEPALIVE_MS: z.coerce.number().int().min(0).default(0),
+
   // --- OIDC / mcp-auth (CF-5) ---
   // Set AUTH_PROVIDER=oidc to enable JWT validation via mcp-auth.
   // When 'none' (default), the legacy MCP_SSE_AUTHORIZATION static Bearer token is used.

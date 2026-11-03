@@ -1,10 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import api from '@actual-app/api';
 import logger from './logger.js';
 import config from './config.js';
 import { connectionPool } from './lib/ActualConnectionPool.js';
+import { withActualApi, closeApiSession } from './lib/actual-adapter.js';
 import { createModuleLogger } from './lib/loggerFactory.js';
 
 const log = createModuleLogger('CONNECTION');
@@ -28,9 +28,7 @@ export async function connectToActual() {
 
   try {
   const SERVER_URL = config.ACTUAL_SERVER_URL;
-  const PASSWORD = config.ACTUAL_PASSWORD;
   const BUDGET_SYNC_ID = config.ACTUAL_BUDGET_SYNC_ID;
-  const BUDGET_PASSWORD = process.env.ACTUAL_BUDGET_PASSWORD; // optional for E2E encrypted budgets
   const TEST_ACTUAL_CONNECTION = process.argv.includes('--test-actual-connection');
 
   // Use configured MCP_BRIDGE_DATA_DIR (fallback to DEFAULT_DATA_DIR) for all runs
@@ -40,46 +38,16 @@ export async function connectToActual() {
 
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-  log.info(`Initializing Actual API with dataDir=${DATA_DIR}`);
+  log.info(`Verifying Actual API connection (dataDir=${DATA_DIR}, budget=${BUDGET_SYNC_ID})`);
 
-    await api.init({
-      dataDir: DATA_DIR,
-      serverURL: SERVER_URL,
-      password: PASSWORD,
-    });
-
-    log.info(`Downloading budget with sync ID: ${BUDGET_SYNC_ID}`);
-
-    // According to official docs, downloadBudget accepts optional second parameter for E2E encryption
-    if (BUDGET_PASSWORD) {
-      const apiWithOptions = api as typeof api & { downloadBudget: (id: string, options?: { password: string }) => Promise<void> };
-      await apiWithOptions.downloadBudget(BUDGET_SYNC_ID, { password: BUDGET_PASSWORD });
-    } else {
-      await api.downloadBudget(BUDGET_SYNC_ID);
-    }
+    // Open and close one session through the shared API session lock
+    // (init → downloadBudget → shutdown). Calling api.init() directly here would
+    // re-initialise the singleton underneath any in-flight tool call, and leaving
+    // it open is pointless: every tool call opens its own session anyway.
+    await withActualApi(async () => {});
 
     if (TEST_ACTUAL_CONNECTION) {
-      logger.info('Test flag detected (--test-actual-connection) — closing Actual session.');
-
-      // Prefer the documented shutdown method only
-      try {
-        const maybeApi = api as unknown as { shutdown?: Function };
-        if (typeof maybeApi.shutdown === 'function') {
-          await (maybeApi.shutdown as () => Promise<unknown>)();
-        } else {
-          logger.warn('No shutdown method found on Actual API; leaving session as-is.');
-        }
-      } catch (closeErr) {
-        logger.error('Error while shutting down Actual session during test run:', closeErr);
-      }
-
-      // allow small grace period for any IO to finish before cleanup/exit
-      await new Promise((res) => setTimeout(res, 500));
-
-      // no temp data dir cleanup — use persistent MCP_BRIDGE_DATA_DIR as configured
-
-      logger.info('Exiting process after test connection.');
-      // exit explicitly for test mode
+      logger.info('Test flag detected (--test-actual-connection) — connection verified, exiting.');
       process.exit(0);
     }
 
@@ -102,10 +70,8 @@ export async function shutdownActual() {
   }
   
   try {
-    const maybeApi = api as unknown as { shutdown?: Function };
-    if (typeof maybeApi.shutdown === 'function') {
-      await (maybeApi.shutdown as () => Promise<unknown>)();
-    }
+    // Under the session lock so an in-flight tool call can finish first.
+    await closeApiSession();
     initialized = false;
     logger.info('Actual API shutdown complete.');
   } catch (err) {

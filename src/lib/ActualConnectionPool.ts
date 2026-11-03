@@ -11,14 +11,19 @@
  * need to support multiple instances or we'd need request queuing.
  */
 
-import api from '@actual-app/api';
 import logger from '../logger.js';
 import config from '../config.js';
+import { withActualApi, closeApiSession } from './actual-adapter.js';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
 
 const DEFAULT_DATA_DIR = path.resolve(os.homedir() || '.', '.actual');
+
+/** api.shutdown() under the shared API session lock (never mid-operation). */
+async function shutdownApiExclusive(): Promise<void> {
+  await closeApiSession();
+}
 
 interface ActualConnection {
   sessionId: string;
@@ -129,10 +134,6 @@ class ActualConnectionPool {
     // Create new connection for this session
     logger.info(`[ConnectionPool] Creating Actual connection for session: ${sessionId} (${activeConnections + 1}/${this.MAX_CONCURRENT_SESSIONS})`);
     
-    const SERVER_URL = config.ACTUAL_SERVER_URL;
-    const PASSWORD = config.ACTUAL_PASSWORD;
-    const BUDGET_SYNC_ID = config.ACTUAL_BUDGET_SYNC_ID;
-    const BUDGET_PASSWORD = process.env.ACTUAL_BUDGET_PASSWORD;
     
     // Use shared data directory so changes persist across sessions
     // This is critical - all sessions must share the same database to avoid data loss
@@ -143,20 +144,12 @@ class ActualConnectionPool {
     }
 
     try {
-      await api.init({
-        dataDir: DATA_DIR,
-        serverURL: SERVER_URL,
-        password: PASSWORD,
-      });
-
-      logger.info(`[ConnectionPool] Downloading budget for session: ${sessionId}`);
-      
-      if (BUDGET_PASSWORD) {
-        const apiWithOptions = api as typeof api & { downloadBudget: (id: string, options?: { password: string }) => Promise<void> };
-        await apiWithOptions.downloadBudget(BUDGET_SYNC_ID, { password: BUDGET_PASSWORD });
-      } else {
-        await api.downloadBudget(BUDGET_SYNC_ID);
-      }
+      // Verify connectivity + credentials by opening (and closing) a session
+      // through the shared API session lock. Calling api.init() directly here
+      // would re-initialise the singleton underneath any tool call that is
+      // currently running for another session.
+      logger.info(`[ConnectionPool] Verifying Actual connection for session: ${sessionId}`);
+      await withActualApi(async () => {});
 
       conn = {
         sessionId,
@@ -170,19 +163,7 @@ class ActualConnectionPool {
       
     } catch (err) {
       logger.error(`[ConnectionPool] Failed to initialize connection for session ${sessionId}:`, err);
-      
-      // Clean up the failed connection attempt
-      // Try to shutdown the API to leave it in a clean state for the next attempt
-      try {
-        const maybeApi = api as unknown as { shutdown?: Function };
-        if (typeof maybeApi.shutdown === 'function') {
-          await (maybeApi.shutdown as () => Promise<unknown>)();
-          logger.debug(`[ConnectionPool] Cleaned up failed connection for session: ${sessionId}`);
-        }
-      } catch (cleanupErr) {
-        logger.debug(`[ConnectionPool] Error during cleanup (ignoring): ${cleanupErr}`);
-      }
-      
+      // withActualApi already shut the API down; nothing else to clean up.
       // Ensure this session is not in the connections map
       this.connections.delete(sessionId);
       
@@ -201,10 +182,6 @@ class ActualConnectionPool {
 
     logger.info('[ConnectionPool] Creating shared Actual connection');
     
-    const SERVER_URL = config.ACTUAL_SERVER_URL;
-    const PASSWORD = config.ACTUAL_PASSWORD;
-    const BUDGET_SYNC_ID = config.ACTUAL_BUDGET_SYNC_ID;
-    const BUDGET_PASSWORD = process.env.ACTUAL_BUDGET_PASSWORD;
     const DATA_DIR = config.MCP_BRIDGE_DATA_DIR || DEFAULT_DATA_DIR;
 
     if (!fs.existsSync(DATA_DIR)) {
@@ -212,18 +189,8 @@ class ActualConnectionPool {
     }
 
     try {
-      await api.init({
-        dataDir: DATA_DIR,
-        serverURL: SERVER_URL,
-        password: PASSWORD,
-      });
-
-      if (BUDGET_PASSWORD) {
-        const apiWithOptions = api as typeof api & { downloadBudget: (id: string, options?: { password: string }) => Promise<void> };
-        await apiWithOptions.downloadBudget(BUDGET_SYNC_ID, { password: BUDGET_PASSWORD });
-      } else {
-        await api.downloadBudget(BUDGET_SYNC_ID);
-      }
+      // Verify through the shared session lock (see getConnection).
+      await withActualApi(async () => {});
 
       this.sharedConnection = {
         sessionId: 'shared',
@@ -253,11 +220,10 @@ class ActualConnectionPool {
     logger.info(`[ConnectionPool] Shutting down connection for session: ${sessionId}`);
     
     try {
-      const maybeApi = api as unknown as { shutdown?: Function };
-      if (typeof maybeApi.shutdown === 'function') {
-        await (maybeApi.shutdown as () => Promise<unknown>)();
-      }
-      
+      // Bookkeeping only. Every operation already ends with api.shutdown()
+      // inside withActualApi; calling it again here (e.g. from the idle-cleanup
+      // timer) used to close the budget underneath another session's in-flight
+      // tool call.
       conn.initialized = false;
       this.connections.delete(sessionId);
       
@@ -282,11 +248,8 @@ class ActualConnectionPool {
     logger.info('[ConnectionPool] Shutting down shared connection');
     
     try {
-      const maybeApi = api as unknown as { shutdown?: Function };
-      if (typeof maybeApi.shutdown === 'function') {
-        await (maybeApi.shutdown as () => Promise<unknown>)();
-      }
-      
+      await shutdownApiExclusive();
+
       this.sharedConnection.initialized = false;
       this.sharedConnection = null;
       
@@ -306,11 +269,8 @@ class ActualConnectionPool {
       logger.info('[ConnectionPool] Force closing any stale connections from previous instance');
       
       // Try to shutdown the API if it was left initialized
-      const maybeApi = api as unknown as { shutdown?: Function };
-      if (typeof maybeApi.shutdown === 'function') {
-        await (maybeApi.shutdown as () => Promise<unknown>)();
-        logger.info('[ConnectionPool] Successfully closed stale API connection');
-      }
+      await shutdownApiExclusive();
+      logger.info('[ConnectionPool] Successfully closed stale API connection');
     } catch (err) {
       // Ignore errors - connection may not have been initialized
       logger.debug('[ConnectionPool] No stale connections to close (or already closed)');
@@ -375,7 +335,15 @@ class ActualConnectionPool {
     }
 
     await Promise.all(shutdownPromises);
-    
+
+    // Final safety net: make sure the API singleton is closed, waiting for any
+    // in-flight operation to finish first.
+    try {
+      await shutdownApiExclusive();
+    } catch (err) {
+      logger.warn('[ConnectionPool] Final API shutdown failed:', err);
+    }
+
     logger.info('[ConnectionPool] All connections shut down');
   }
 

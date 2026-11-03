@@ -8,10 +8,25 @@
  * Writes to context:   (none)
  *
  * Environment:
- *   EXPECTED_TOOL_COUNT  Expected number of registered MCP tools (default: 56)
+ *   EXPECTED_TOOL_COUNT  Expected number of registered MCP tools
+ *                        (default: length of IMPLEMENTED_TOOLS in src/actualToolsManager.ts)
  */
 
-const EXPECTED_TOOL_COUNT = parseInt(process.env.EXPECTED_TOOL_COUNT || '62', 10);
+import { readFileSync } from 'node:fs';
+
+/** Count IMPLEMENTED_TOOLS in this checkout so the default never goes stale. */
+function implementedToolCount() {
+  try {
+    const src = readFileSync(new URL('../../../src/actualToolsManager.ts', import.meta.url), 'utf8');
+    const block = src.match(/const IMPLEMENTED_TOOLS\s*=\s*\[([\s\S]*?)\]/);
+    const names = block ? block[1].match(/'actual_[A-Za-z0-9_]+'/g) : null;
+    return names ? names.length : null;
+  } catch {
+    return null;
+  }
+}
+
+const EXPECTED_TOOL_COUNT = parseInt(process.env.EXPECTED_TOOL_COUNT || String(implementedToolCount() ?? 63), 10);
 
 /**
  * @param {{ listTools: Function, callTool: Function }} client

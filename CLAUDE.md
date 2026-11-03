@@ -113,6 +113,8 @@ await withActualApi(async () => { return await rawAddTransactions(data); });
 await rawAddTransactions(data);
 ```
 
+`withActualApi` / `queueWriteOperation` are backed by the session coordinator in `src/lib/api-session.ts`: one FIFO lock for the whole process (with `ACTUAL_*_TIMEOUT_MS` bounds on lock wait, init, operation, sync, shutdown), re-entrant (nested adapter calls inside an open session run inline — no deadlock), and writes batched into one session + one `sync()`. **Never call `api.init()` / `api.shutdown()` directly** — use `withActualApi` / `closeApiSession()` so the singleton is never re-initialised or closed under an in-flight call. With `ACTUAL_SESSION_KEEPALIVE_MS > 0` the budget stays open between calls and each call runs `sync()` instead of init/shutdown; a read-path operation that mutates data must pass `{ syncAfter: true }` (see `runBankSync`).
+
 ### Tool Structure Pattern
 
 New tools should use `createTool()` from `src/lib/toolFactory.ts` — it wires up error handling, logging, and observability automatically:
@@ -215,7 +217,7 @@ export default tool;
 
 **Session tools are the only exception to `withActualApi`**: `actual_session_list` and `actual_session_close` call `connectionPool` directly — they manage the pool itself, not budget data, so they skip the wrapper intentionally.
 
-**If transactions/budgets don't persist**: verify `withActualApi` wraps the call (grep for `rawAdd*` / `rawUpdate*` called without it), confirm `api.shutdown()` runs after the operation, and check logs for "tombstone" errors. The `getConcurrencyState()` export from `actual-adapter.ts` shows `{ active, queued, limit }` for diagnosing concurrency back-pressure.
+**If transactions/budgets don't persist**: verify `withActualApi` wraps the call (grep for `rawAdd*` / `rawUpdate*` called without it), confirm `api.shutdown()` runs after the operation, and check logs for "tombstone" errors. The `getApiSessionState()` export from `actual-adapter.ts` (also on `GET /health` as `apiSession`) shows lock holder/waiters, pending writes and keep-alive session state for diagnosing back-pressure.
 
 ## File Safety Tiers
 
